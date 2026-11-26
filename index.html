@@ -262,6 +262,7 @@
         <div style="display:flex; gap:6px; margin-top:6px;">
           <button class="btn btn-cyan" id="btnTerrainShow" style="padding:3px 8px; font-size:10px;">MOSTRA SU MAPPA</button>
           <button class="btn" id="btnTerrainProfile" style="padding:3px 8px; font-size:10px;">PROFILO &rarr;</button>
+          <button class="btn btn-amber" id="btnTerrainEdit" style="padding:3px 8px; font-size:10px;">MODIFICA ROTTA</button>
         </div>
       </div>
       <div class="result-card">
@@ -397,6 +398,21 @@
           </div>
           <div id="windSummaryPending" style="color:var(--amber); font-weight:700; margin-top:3px; display:none;">Modifiche non validate nella scheda Meteo</div>
         </div>
+      </div>
+
+      <div class="box" id="routeBox">
+        <div class="box-title">
+          <span>4. ROTTA DI AVVICINAMENTO</span>
+          <button class="btn btn-cyan" id="btnRouteEdit" style="padding:2px 7px; font-size:10px;">MODIFICA SU MAPPA</button>
+        </div>
+        <div class="wind-note" id="routeSummary">--</div>
+        <div id="routeWpList"></div>
+        <div style="display:grid; grid-template-columns:1fr auto; gap:6px; margin-top:6px;">
+          <input type="text" id="routeWpMgrs" placeholder="MGRS punto di passaggio" />
+          <button class="btn" id="btnRouteAddMgrs">AGGIUNGI</button>
+        </div>
+        <button class="btn" id="btnRouteReset" style="width:100%; margin-top:6px; justify-content:center;">RIPRISTINA ROTTA DIRETTA</button>
+        <div class="warn-msg" id="routeWarn"></div>
       </div>
     </aside>
 
@@ -598,6 +614,7 @@
       windValidated: false, // true = i venti in uso includono rilevamenti in loco validati
       windObsTime: "",
       terrainClearanceFt: 300,  // franco minimo dal terreno per la verifica dei rilievi sulla rotta
+      routeWps: [],             // punti di passaggio della rotta a vela (dal piu' lontano al piu' vicino al DIP)
       winds: [
         { altFt: 2000, dirFrom: 270, spdKt: 12 },
         { altFt: 4000, dirFrom: 275, spdKt: 15 },
@@ -744,6 +761,7 @@
     let pickMode = false;
     document.getElementById("btnMapPick").addEventListener("click", () => {
       pickMode = !pickMode;
+      if (pickMode) setRouteEditMode(false); // le due modalita' di tocco sulla mappa non sono attive insieme
       document.getElementById("btnMapPick").textContent = pickMode ? "CLICCA ORA..." : "CLICCA SU MAPPA";
       document.getElementById("dipStatus").textContent = pickMode
         ? "Tocca un punto sulla mappa per impostare il DIP."
@@ -1629,6 +1647,7 @@
         titleEl.textContent = "VERIFICA RILIEVI NON ESEGUITA";
         textEl.textContent = "Quote del terreno (DEM) non raggiungibili: controlla la connessione. Non è stato verificato se la rotta passa sopra i rilievi.";
         showBtn.style.display = "none";
+        document.getElementById("btnTerrainEdit").style.display = "none";
         return;
       }
       if (!r.zones.length) { box.style.display = "none"; return; }
@@ -1645,6 +1664,7 @@
         textEl.textContent = `Franco inferiore al minimo di ${fmtAltU(state.terrainClearanceFt)}: ` + zoneText(c, r.total) + "." + extra;
       }
       showBtn.style.display = "";
+      document.getElementById("btnTerrainEdit").style.display = "";
     }
 
     function niceStep(range, target) {
@@ -1717,6 +1737,21 @@
       runs.forEach((r) => {
         const d = r.pts.map((sm, i) => (i ? "L" : "M") + f1(xOf(sm.d)) + " " + f1(yOf(toD(sm.altFt)))).join("");
         out += `<path d="${d}" fill="none" stroke="${r.phase === "ff" ? "#f97316" : "#22c55e"}" stroke-width="2.6" stroke-linejoin="round" stroke-linecap="round"/>`;
+      });
+
+      // punti di passaggio della rotta (solo quelli raggiunti)
+      const wpsAll = state.routeWps || [];
+      wpsAll.forEach((w, i) => {
+        if (i < wpsAll.length - routeInfo.reached) return;
+        let best = null, bd = Infinity;
+        samples.forEach((sm) => {
+          const dd = AeronavCore.distanceMeters(sm.lat, sm.lon, w.lat, w.lon);
+          if (dd < bd) { bd = dd; best = sm; }
+        });
+        if (!best || bd > 500) return;
+        const x = xOf(best.d), y = yOf(toD(best.altFt));
+        out += `<circle cx="${f1(x)}" cy="${f1(y)}" r="3.6" fill="#38bdf8" stroke="#082f49" stroke-width="1.2"/>`;
+        out += `<text x="${f1(x)}" y="${f1(y + 14)}" fill="#7dd3fc" font-size="10" font-weight="700" text-anchor="middle">P${i + 1}</text>`;
       });
 
       // punti critici: segmento dal punto di volo al terreno + etichetta del franco
@@ -1833,6 +1868,249 @@
     });
     document.getElementById("btnTerrainProfile").addEventListener("click", () => showTab("profile"));
     syncClearanceInput();
+
+    // ===== MODIFICA ROTTA DI AVVICINAMENTO: punti di passaggio =====
+    const MAX_ROUTE_WPS = 10;
+    let routeInfo = { n: 0, reached: 0, infeasible: [], pathM: 0 };
+    let routeEditMode = false;
+    let routeWpMarkers = [];
+    const routeWpLayer = L.layerGroup().addTo(map);
+
+    function routeWpsValid() {
+      if (!Array.isArray(state.routeWps)) state.routeWps = [];
+      state.routeWps = state.routeWps.filter(w => w && Number.isFinite(w.lat) && Number.isFinite(w.lon));
+      return state.routeWps;
+    }
+
+    // Calcolo a ritroso dal DIP fino alla quota di apertura (vela aperta).
+    // - senza punti: vola sottovento (velocita' al suolo = vento + velocita' vela), come prima;
+    // - con punti: ogni tratto ha una traccia imposta; la vela "granchia" per compensare il vento al traverso.
+    function buildCanopyRouteBackward(o) {
+      const KT = AeronavCore.KT_TO_MS;
+      const vaMs = o.canopyHorizFps * AeronavCore.FT_TO_M;
+      const targets = [...o.wps].reverse();          // dal punto piu' vicino al DIP al piu' lontano
+      const pts = [{ lat: state.dipLat, lon: state.dipLon, altFt: o.startAltFt }];
+      const infeasible = [];
+      let cur = { lat: state.dipLat, lon: state.dipLon };
+      let alt = o.startAltFt;
+      let timeSec = 0;
+      let ti = 0;
+      let guard = 0;
+
+      while (alt < o.openAltFt - 1e-6 && guard++ < 20000) {
+        const tgt = targets[ti] || null;
+        let remaining = 0, brgBack = 0;
+        if (tgt) {
+          remaining = AeronavCore.distanceMeters(cur.lat, cur.lon, tgt.lat, tgt.lon);
+          if (remaining < 5) { ti++; continue; }
+          brgBack = AeronavCore.bearingDegrees(cur.lat, cur.lon, tgt.lat, tgt.lon);
+        }
+        let dh = Math.min(o.stepFt, o.openAltFt - alt);
+        const wind = getWindAtAltitude(alt + dh / 2);
+        const wMs = wind.spdKt * KT;
+        let gs, dirBack;
+        if (!tgt) {
+          gs = wMs + vaMs;
+          dirBack = wind.dirFrom % 360;
+        } else {
+          const trackFwd = (brgBack + 180) % 360;                 // traccia da seguire (verso il DIP)
+          const delta = (((wind.dirFrom + 180) % 360) - trackFwd) * Math.PI / 180; // vento verso dove soffia vs traccia
+          const wPar = wMs * Math.cos(delta);
+          const wPerp = wMs * Math.sin(delta);
+          let ok = true;
+          if (Math.abs(wPerp) >= vaMs * 0.98) {
+            ok = false;
+            gs = Math.max(0.5, wPar);
+          } else {
+            gs = Math.sqrt(vaMs * vaMs - wPerp * wPerp) + wPar;
+            if (gs < 0.5) { ok = false; gs = 0.5; }
+          }
+          if (!ok && !infeasible.some(x => x.ti === ti)) {
+            infeasible.push({ ti, altFt: alt, windKt: wind.spdKt, perpKt: Math.abs(wPerp) * AeronavCore.MS_TO_KT, parKt: wPar * AeronavCore.MS_TO_KT, vaKt: vaMs * AeronavCore.MS_TO_KT });
+          }
+          dirBack = brgBack;
+        }
+        let dtSec = dh / o.sinkRateFps;
+        let dist = gs * dtSec;
+        if (tgt && dist > remaining) {            // l'ultimo passo si ferma sul punto di passaggio
+          const f = remaining / dist;
+          dh *= f; dtSec *= f; dist = remaining;
+        }
+        const nxt = AeronavCore.destinationPoint(cur.lat, cur.lon, dirBack, dist);
+        cur = { lat: nxt.lat, lon: nxt.lon };
+        alt += dh;
+        timeSec += dtSec;
+        pts.push({ lat: cur.lat, lon: cur.lon, altFt: alt });
+      }
+      while (targets[ti] && AeronavCore.distanceMeters(cur.lat, cur.lon, targets[ti].lat, targets[ti].lon) < 5) ti++;
+
+      let pathM = 0;
+      for (let i = 1; i < pts.length; i++) pathM += AeronavCore.distanceMeters(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
+      return {
+        pts, timeSec,
+        info: { n: o.wps.length, reached: ti, infeasible, pathM }
+      };
+    }
+
+    function wpIcon(n, reached) {
+      const bg = reached ? "#38bdf8" : "#64748b";
+      return L.divIcon({
+        html: `<div style="width:22px;height:22px;background:${bg};border:2px solid #082f49;border-radius:50%;color:#041321;font-weight:800;font-size:11px;line-height:18px;text-align:center;box-shadow:0 0 8px ${bg};">${n}</div>`,
+        iconSize: [22, 22],
+        iconAnchor: [11, 11]
+      });
+    }
+
+    function wpPopup(i) {
+      const w = state.routeWps[i];
+      const d = document.createElement("div");
+      d.style.cssText = "font-size:12px; line-height:1.5; min-width:150px; color:#0f172a;";
+      d.innerHTML = `<strong>Punto di passaggio P${i + 1}</strong><br><span style="font-family:monospace;">${w ? AeronavCore.latLonToMgrs(w.lat, w.lon, 5) : ""}</span><br>`;
+      const b = document.createElement("button");
+      b.textContent = "ELIMINA PUNTO";
+      b.style.cssText = "margin-top:6px; padding:5px 8px; border:1px solid #b91c1c; background:#fee2e2; color:#991b1b; border-radius:5px; font-weight:700; cursor:pointer;";
+      b.addEventListener("click", () => { map.closePopup(); removeRouteWp(i); });
+      d.appendChild(b);
+      return d;
+    }
+
+    function makeWpMarker(i) {
+      const w = state.routeWps[i];
+      const m = L.marker([w.lat, w.lon], { icon: wpIcon(i + 1, true), draggable: true, zIndexOffset: 1200 }).addTo(routeWpLayer);
+      m.on("dragend", () => {
+        const ll = m.getLatLng();
+        moveRouteWp(i, ll.lat, ll.lng);
+      });
+      m.bindPopup(() => wpPopup(i));
+      return m;
+    }
+
+    // Aggiorna i marcatori sulla mappa (riusa quelli esistenti se il numero di punti non cambia)
+    function renderRouteWps() {
+      const wps = routeWpsValid();
+      if (routeWpMarkers.length !== wps.length) {
+        routeWpLayer.clearLayers();
+        routeWpMarkers = wps.map((_, i) => makeWpMarker(i));
+      }
+      wps.forEach((w, i) => {
+        const m = routeWpMarkers[i];
+        m.setLatLng([w.lat, w.lon]);
+        m.setIcon(wpIcon(i + 1, i >= wps.length - routeInfo.reached));
+      });
+    }
+
+    function renderRouteList() {
+      const wps = routeWpsValid();
+      const list = document.getElementById("routeWpList");
+      list.innerHTML = "";
+      wps.forEach((w, i) => {
+        const reached = i >= wps.length - routeInfo.reached;
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex; align-items:center; gap:8px; padding:4px 2px; border-bottom:1px dashed var(--border); font-size:11px;";
+        row.innerHTML = `<strong style="color:${reached ? "var(--cyan)" : "var(--muted)"}; min-width:24px;">P${i + 1}</strong>` +
+          `<span style="flex:1; font-family:monospace; cursor:pointer;" title="Centra la mappa">${AeronavCore.latLonToMgrs(w.lat, w.lon, 5)}${reached ? "" : " · non raggiunto"}</span>` +
+          `<button type="button" class="wind-row-btn del" title="Elimina il punto">✕</button>`;
+        row.querySelector("span").addEventListener("click", () => { map.setView([w.lat, w.lon], Math.max(map.getZoom(), 13)); });
+        row.querySelector("button").addEventListener("click", () => removeRouteWp(i));
+        list.appendChild(row);
+      });
+
+      const sum = document.getElementById("routeSummary");
+      if (!wps.length) {
+        sum.textContent = "Rotta diretta: la vela vola sottovento (massima portata). Aggiungi punti di passaggio per aggirare un rilievo o cambiare l'avvicinamento.";
+      } else {
+        sum.innerHTML = `<strong style="color:var(--text);">${wps.length}</strong> ${wps.length === 1 ? "punto di passaggio" : "punti di passaggio"} · percorso a vela <strong style="color:var(--text);">${(routeInfo.pathM / 1000).toFixed(1).replace(".", ",")} km</strong>. ` +
+          `Il punto di apertura e l'HARP sono ricalcolati sul nuovo percorso.`;
+      }
+
+      // avvisi: tratti non percorribili e punti non raggiunti
+      const msgs = [];
+      routeInfo.infeasible.forEach((x) => {
+        const label = `P${wps.length - x.ti}`;
+        const wnd = spdDisp(x.windKt), perp = spdDisp(x.perpKt), va = spdDisp(x.vaKt);
+        const u = isMetricSpd ? "m/s" : "kt";
+        msgs.push(`Tratto da ${label}: il vento (${wnd} ${u}, di cui ${perp} ${u} al traverso e ${spdDisp(x.parKt)} ${u} lungo la traccia) non permette di mantenere la traccia con la velocità della vela (${va} ${u}) a ${fmtAltU(x.altFt)}: tratto non percorribile.`);
+      });
+      const unreached = wps.length - routeInfo.reached;
+      if (unreached > 0 && wps.length) {
+        const names = []; for (let k = 0; k < unreached; k++) names.push("P" + (k + 1));
+        msgs.push(`${names.join(", ")} ${unreached === 1 ? "non è raggiunto" : "non sono raggiunti"}: la quota di apertura si esaurisce prima. Alza la quota di apertura/lancio o avvicina i punti al DIP.`);
+      }
+      document.getElementById("routeWarn").textContent = msgs.join(" ");
+    }
+
+    // Inserimento a costo minimo: il nuovo punto va nel tratto della catena apertura -> punti -> DIP che allunga meno il percorso
+    function addRouteWpAt(lat, lon) {
+      const wps = routeWpsValid();
+      if (wps.length >= MAX_ROUTE_WPS) {
+        document.getElementById("dipStatus").textContent = `Massimo ${MAX_ROUTE_WPS} punti di passaggio.`;
+        return;
+      }
+      const chain = [{ lat: state.openLat, lon: state.openLon }, ...wps, { lat: state.dipLat, lon: state.dipLon }];
+      const dist = (a, b) => AeronavCore.distanceMeters(a.lat, a.lon, b.lat, b.lon);
+      const np = { lat, lon };
+      let best = 0, bestExtra = Infinity;
+      for (let i = 0; i < chain.length - 1; i++) {
+        const extra = dist(chain[i], np) + dist(np, chain[i + 1]) - dist(chain[i], chain[i + 1]);
+        if (extra < bestExtra) { bestExtra = extra; best = i; }
+      }
+      wps.splice(best, 0, np);
+      recalculateHarp(false);
+    }
+    function moveRouteWp(i, lat, lon) {
+      const wps = routeWpsValid();
+      if (!wps[i]) return;
+      wps[i] = { lat, lon };
+      recalculateHarp(false);
+    }
+    function removeRouteWp(i) {
+      const wps = routeWpsValid();
+      if (!wps[i]) return;
+      wps.splice(i, 1);
+      recalculateHarp(false);
+    }
+
+    function setRouteEditMode(on) {
+      routeEditMode = !!on;
+      const btn = document.getElementById("btnRouteEdit");
+      btn.textContent = routeEditMode ? "FINE MODIFICA" : "MODIFICA SU MAPPA";
+      btn.classList.toggle("btn-amber", routeEditMode);
+      btn.classList.toggle("btn-cyan", !routeEditMode);
+      map.getContainer().style.cursor = routeEditMode ? "crosshair" : "";
+      if (routeEditMode) {
+        pickMode = false;
+        document.getElementById("btnMapPick").textContent = "CLICCA SU MAPPA";
+        document.getElementById("dipStatus").textContent = "Modifica rotta: tocca la mappa per aggiungere un punto di passaggio, trascina un punto per spostarlo, tocca un punto per eliminarlo.";
+      } else if (document.getElementById("dipStatus").textContent.startsWith("Modifica rotta")) {
+        document.getElementById("dipStatus").textContent = "Pronto.";
+      }
+    }
+
+    map.on("click", (e) => {
+      if (!routeEditMode || pickMode) return;
+      addRouteWpAt(e.latlng.lat, e.latlng.lng);
+    });
+    document.getElementById("btnRouteEdit").addEventListener("click", () => setRouteEditMode(!routeEditMode));
+    document.getElementById("btnRouteReset").addEventListener("click", () => {
+      if (routeWpsValid().length && !confirm("Eliminare tutti i punti di passaggio e tornare alla rotta diretta?")) return;
+      state.routeWps = [];
+      recalculateHarp(false);
+    });
+    document.getElementById("btnRouteAddMgrs").addEventListener("click", () => {
+      const inp = document.getElementById("routeWpMgrs");
+      try {
+        const { lat, lon } = AeronavCore.mgrsToLatLon(inp.value);
+        inp.value = "";
+        addRouteWpAt(lat, lon);
+      } catch (err) {
+        document.getElementById("dipStatus").textContent = "Errore MGRS: " + err.message;
+      }
+    });
+    document.getElementById("btnTerrainEdit").addEventListener("click", () => {
+      setRouteEditMode(true);
+      const rb = document.getElementById("routeBox");
+      if (rb.scrollIntoView) rb.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
 
     let windsSorted = [];
     function getWindAtAltitude(altFt) {
@@ -1968,23 +2246,21 @@
       let currLat = state.dipLat;
       let currLon = state.dipLon;
 
-      for (let alt = targetArrivalAltFt; alt < openAltEffFt; alt += canopyStepFt) {
-        const dh = Math.min(canopyStepFt, openAltEffFt - alt);
-        const midAlt = alt + dh / 2;
-        const wind = getWindAtAltitude(midAlt);
-
-        const dtSec = dh / sinkRateFps;
-        canopyTimeSec += dtSec;
-
-        const groundSpeedMs = (wind.spdKt + canopyHorizKt) * AeronavCore.KT_TO_MS;
-        const stepDistM = groundSpeedMs * dtSec;
-
-        const upwindDeg = wind.dirFrom % 360;
-        const nextPt = AeronavCore.destinationPoint(currLat, currLon, upwindDeg, stepDistM);
-        currLat = nextPt.lat;
-        currLon = nextPt.lon;
-        canopyPts.push({ lat: currLat, lon: currLon, altFt: alt + dh });
-      }
+      // Senza punti di passaggio la vela vola sottovento (massima portata); con punti di passaggio segue i tratti
+      // tra di essi compensando il vento (triangolo del vento).
+      const cr = buildCanopyRouteBackward({
+        startAltFt: targetArrivalAltFt,
+        openAltFt: openAltEffFt,
+        stepFt: canopyStepFt,
+        sinkRateFps,
+        canopyHorizFps,
+        wps: routeWpsValid()
+      });
+      cr.pts.slice(1).forEach(q => canopyPts.push(q));
+      canopyTimeSec = cr.timeSec;
+      currLat = cr.pts[cr.pts.length - 1].lat;
+      currLon = cr.pts[cr.pts.length - 1].lon;
+      routeInfo = cr.info;
 
       state.openLat = currLat;
       state.openLon = currLon;
@@ -2050,7 +2326,9 @@
       routeLine.setLatLngs(canopyLatLngs);
       freefallLine.setLatLngs(freefallLatLngs);
 
-      const canopyDistM = AeronavCore.distanceMeters(state.openLat, state.openLon, state.dipLat, state.dipLon);
+      const canopyDistM = routeInfo.n > 0
+        ? routeInfo.pathM
+        : AeronavCore.distanceMeters(state.openLat, state.openLon, state.dipLat, state.dipLon);
       routeLine.setTooltipContent(
         "VELA APERTA (apertura → atterraggio): " + fmtDist(canopyDistM) + " | " + (canopyTimeSec / 60).toFixed(1) + " min"
       );
@@ -2083,6 +2361,8 @@
 
       fitTrack(freefallLatLngs.concat(canopyLatLngs), forceFit);
 
+      renderRouteWps();
+      renderRouteList();
       scheduleOpenGroundElev();
       renderWindStatus();
       scheduleSkewT();
@@ -2136,10 +2416,15 @@
     <name>DIP</name>
     <desc>MGRS: ${AeronavCore.latLonToMgrs(state.dipLat, state.dipLon, 5)}</desc>
   </wpt>
+${(state.routeWps || []).map((w, i) => `  <wpt lat="${w.lat.toFixed(6)}" lon="${w.lon.toFixed(6)}">
+    <name>P${i + 1}</name>
+    <desc>Punto di passaggio - MGRS: ${AeronavCore.latLonToMgrs(w.lat, w.lon, 5)}</desc>
+  </wpt>`).join("\n")}
   <rte>
     <name>HAHO_HARP_TO_DIP</name>
     <rtept lat="${state.harpLat.toFixed(6)}" lon="${state.harpLon.toFixed(6)}"><name>HARP</name></rtept>
     <rtept lat="${state.openLat.toFixed(6)}" lon="${state.openLon.toFixed(6)}"><name>OPEN</name></rtept>
+${(state.routeWps || []).map((w, i) => `    <rtept lat="${w.lat.toFixed(6)}" lon="${w.lon.toFixed(6)}"><name>P${i + 1}</name></rtept>`).join("\n")}
     <rtept lat="${state.dipLat.toFixed(6)}" lon="${state.dipLon.toFixed(6)}"><name>DIP</name></rtept>
   </rte>
 </gpx>`;
